@@ -210,6 +210,8 @@ do
 	local cx = make_cx("A")
 	tick(w, cx)
 	check(deliveries(cx) == 1, "  the valid entry still runs", deliveries(cx))
+	w.now = T0 + 30
+	tick(w, cx)
 	check(#cx.toasts == 1 and has(cx.toasts[1], "no string id"), "  the entry is reported", table.concat(cx.toasts, " | "))
 end
 
@@ -424,6 +426,157 @@ do
 	tick(w, cx)
 	check(#cx.starts == 1, "  a block is opened", #cx.starts)
 	check(w.shown == 1, "  the window shows the session it showed before", w.shown)
+end
+
+print("a scan of the blocks in a place is spread over ticks")
+do
+	local panes = { { pane = 7, kind = "agent", cwd = "/home/x", title = "a", tab = 20 } }
+	local agents = { { pane = 7, state = "idle" } }
+	local transcript = { [7] = { { role = "user", text = "head" } } }
+	for i = 1, 8 do
+		local pane = 100 + i
+		panes[#panes + 1] = { pane = pane, kind = "agent", cwd = "/elsewhere/" .. i, title = "b" .. i, tab = 20 }
+		agents[#agents + 1] = { pane = pane, state = "idle" }
+		transcript[pane] = { { role = "user", text = i == 8 and "head" or ("other " .. i) } }
+	end
+	local w = new_world({
+		tasks = { { id = "t", every = "1h", prompt = "p.md", cwd = "~/work", place = { session = "work" } } },
+		files = { ["/plugin/p.md"] = "go" },
+		kv = { pins = { t = { pane = 7 } } },
+	})
+	load_plugin()
+	local cx = make_cx("A", {
+		panes = panes,
+		agents = agents,
+		transcript = transcript,
+		sessions = { { id = 2, name = "work", tabs = { 20 } } },
+		tabs = { { id = 20, session = 2, name = "work" } },
+	})
+	tick(w, cx) -- sends into the pinned pane; no read without a fingerprint
+	check(#cx.reads == 0 and #cx.asks == 1 and cx.asks[1].pane == 7, "  an unknown pin needs no chat read", #cx.reads)
+	for _, timer in ipairs(w.timers) do
+		if timer.ms == 4000 then
+			timer.fn(cx) -- the fingerprint refresh
+		end
+	end
+	local fp = (((w.kv.pins or {}).t or {}).fp)
+	check(fp ~= nil and fp.n == 1, "  the refresh stored its fingerprint", fp and fp.n)
+	table.remove(panes, 1) -- the pinned pane is gone; eight blocks remain in the place
+	w.now = T0 + 3600
+	cx.reads = {}
+	tick(w, cx)
+	check(#cx.reads == 6 and #cx.asks == 1, "  the first tick reads six blocks at most", #cx.reads)
+	check(task_state(w, "t").next == (T0 + 3600) * 1000, "  the slot stays due", task_state(w, "t").next)
+	check(#(task_state(w, "t").runs or {}) == 1, "  no run is recorded yet", #(task_state(w, "t").runs or {}))
+	w.now = T0 + 3630
+	tick(w, cx)
+	check(#cx.reads == 8, "  the next tick finishes the scan", #cx.reads)
+	check(#cx.asks == 2 and cx.asks[2].pane == 108, "  it found the block with that conversation", cx.asks[2] and cx.asks[2].pane)
+end
+
+print("a scan looks at the block at the task's cwd first")
+do
+	local panes = { { pane = 31, kind = "agent", cwd = "/home/x/work", title = "w", tab = 20 } }
+	local agents = { { pane = 31, state = "idle" } }
+	local transcript = { [31] = { { role = "user", text = "head" } } }
+	local w = new_world({
+		tasks = { { id = "t", every = "1h", prompt = "p.md", cwd = "~/work", place = { session = "work" } } },
+		files = { ["/plugin/p.md"] = "go" },
+		kv = { pins = { t = { pane = 31 } } },
+	})
+	load_plugin()
+	local cx = make_cx("A", {
+		panes = panes,
+		agents = agents,
+		transcript = transcript,
+		sessions = { { id = 2, name = "work", tabs = { 20 } } },
+		tabs = { { id = 20, session = 2, name = "work" } },
+	})
+	tick(w, cx)
+	for _, timer in ipairs(w.timers) do
+		if timer.ms == 4000 then
+			timer.fn(cx)
+		end
+	end
+	table.remove(panes, 1)
+	panes[#panes + 1] = { pane = 32, kind = "agent", cwd = "/home/x/work", title = "w2", tab = 20 }
+	panes[#panes + 1] = { pane = 33, kind = "agent", cwd = "/elsewhere", title = "x", tab = 20 }
+	agents[#agents + 1] = { pane = 32, state = "idle" }
+	agents[#agents + 1] = { pane = 33, state = "idle" }
+	transcript[32] = { { role = "user", text = "head" } }
+	transcript[33] = { { role = "user", text = "other" } }
+	cx.reads = {}
+	w.now = T0 + 3600
+	tick(w, cx)
+	check(cx.reads[1] == 32, "  the block at the task's cwd is looked at first", cx.reads[1])
+	check(#cx.asks == 2 and cx.asks[2].pane == 32, "  it is the one that gets the prompt", cx.asks[2] and cx.asks[2].pane)
+end
+
+print("an unfingerprinted pin picks a block without reading chats")
+do
+	local w = new_world({
+		tasks = { { id = "t", every = "1h", prompt = "p.md", cwd = "~", place = { session = "work" } } },
+		files = { ["/plugin/p.md"] = "go" },
+		kv = { pins = { t = { pane = 999 } } },
+	})
+	load_plugin()
+	local cx = make_cx("A", {
+		panes = {
+			{ pane = 41, kind = "agent", cwd = "/x", title = "a", tab = 20 },
+			{ pane = 42, kind = "agent", cwd = "/y", title = "b", tab = 20 },
+		},
+		agents = { { pane = 41, state = "idle" }, { pane = 42, state = "idle" } },
+		sessions = { { id = 2, name = "work", tabs = { 20 } } },
+		tabs = { { id = 20, session = 2, name = "work" } },
+	})
+	tick(w, cx)
+	check(#cx.reads == 0, "  no chat is read", #cx.reads)
+	check(#cx.asks == 1 and cx.asks[1].pane == 41, "  the first block in the place gets the prompt", cx.asks[1] and cx.asks[1].pane)
+end
+
+print("two tasks that come due together are sent a tick apart")
+do
+	local w = new_world({
+		tasks = {
+			{ id = "a", every = "1h", prompt = "a.md", cwd = "~" },
+			{ id = "b", every = "1h", prompt = "b.md", cwd = "~" },
+		},
+		files = { ["/plugin/a.md"] = "A", ["/plugin/b.md"] = "B" },
+	})
+	load_plugin()
+	local cx = make_cx("A")
+	tick(w, cx)
+	check(#cx.starts == 1 and cx.starts[1].prompt == "A", "  the first tick sends the first task", #cx.starts)
+	w.now = T0 + 30
+	tick(w, cx)
+	check(#cx.starts == 2 and cx.starts[2].prompt == "B", "  the next tick sends the other", #cx.starts)
+	w.now = T0 + 60
+	tick(w, cx)
+	check(#cx.starts == 2, "  then nothing until a slot is due", #cx.starts)
+end
+
+print("a busy block does not hold back the next task")
+do
+	local w = new_world({
+		tasks = {
+			{ id = "busy", every = "1h", prompt = "a.md", cwd = "~" },
+			{ id = "next", every = "1h", prompt = "b.md", cwd = "~" },
+		},
+		files = { ["/plugin/a.md"] = "A", ["/plugin/b.md"] = "B" },
+		kv = {
+			state = { tasks = { busy = { interval = 3600 * 1000, next = T0 * 1000 } } },
+			pins = { busy = { pane = 7 } },
+		},
+	})
+	load_plugin()
+	local cx = make_cx("A", {
+		panes = { { pane = 7, kind = "agent", cwd = "/x", title = "a" } },
+		agents = { { pane = 7, state = "working" } },
+	})
+	tick(w, cx)
+	local run = last_run(w, "busy")
+	check(run and run.outcome == "skipped", "  the busy task is skipped", run and run.outcome)
+	check(#cx.starts == 1 and cx.starts[1].prompt == "B", "  the next task still runs", #cx.starts)
 end
 
 print(string.format("%d passed, %d failed", passed, failed))

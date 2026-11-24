@@ -75,6 +75,7 @@ tern = {
 	getenv = function(name)
 		return name == "HOME" and "/home/x" or nil
 	end,
+	now = function() return W.now * 1000 end,
 	timer = function(ms, fn)
 		W.timers[#W.timers + 1] = { ms = ms, fn = fn }
 	end,
@@ -132,7 +133,7 @@ os = {
 -- sent (another window's doing), `pick` the row cx:pick settles on.
 local function make_cx(key, opts)
 	opts = opts or {}
-	local cx = { key = key, asks = {}, starts = {}, toasts = {}, picks = {} }
+	local cx = { key = key, asks = {}, starts = {}, toasts = {}, picks = {}, reads = {} }
 	local panes = opts.panes or {}
 	local function find(id)
 		if type(id) ~= "number" then
@@ -239,6 +240,7 @@ local function make_cx(key, opts)
 		end
 	end
 	function agents:transcript(pane, spec)
+		cx.reads[#cx.reads + 1] = pane
 		local chat = (opts.transcript or {})[pane] or {}
 		local out = {}
 		local first = math.max(1, #chat - (spec and spec.last or 50) + 1)

@@ -8,8 +8,12 @@ local HISTORY = 10
 local OWNER_STALE_MS = 3 * 60 * 1000
 local HEARTBEAT_MS = 60 * 1000
 local FP_WINDOW = 1000
+local SCAN_MS = 120
+local SCAN_PROBES = 6
+local SCAN_TTL_MS = 10 * 60 * 1000
 local UNITS = { s = 1000, m = 60 * 1000, h = 3600 * 1000, d = DAY_MS }
 local warned = {}
+local scans = {}
 
 local function warn_once(key, text)
 	if warned[key] then
@@ -253,6 +257,66 @@ local function expanded_cwd(path)
 	return path
 end
 
+-- Finds the task's block among the panes of its place. Comparing fingerprints
+-- means reading a block's chat, and the first read of a chat can be slow, so a
+-- scan looks at only a few blocks per callback and remembers the rest for the
+-- next tick. Returns a pane, or nil plus true while blocks remain to look at.
+local function scoped_target(cx, task, pin, states, scoped)
+	local cwd = task.cwd and expanded_cwd(tostring(task.cwd))
+	local matching, others = {}, {}
+	for _, info in ipairs(scoped) do
+		if usable(cx, info.pane, states) then
+			if cwd ~= nil and info.cwd == cwd then
+				matching[#matching + 1] = info.pane
+			else
+				others[#others + 1] = info.pane
+			end
+		end
+	end
+	local candidates = {}
+	for _, pane in ipairs(matching) do
+		candidates[#candidates + 1] = pane
+	end
+	for _, pane in ipairs(others) do
+		candidates[#candidates + 1] = pane
+	end
+	if #candidates == 0 then
+		return nil
+	end
+	if not (pin and pin.fp) then
+		-- No fingerprint to compare: any agent in the place will do.
+		return candidates[1]
+	end
+	local clock = tern.now()
+	local scan = scans[task.id]
+	if scan == nil or clock - scan.at > SCAN_TTL_MS then
+		scan = { tried = {}, at = clock }
+		scans[task.id] = scan
+	end
+	local deadline = clock + SCAN_MS
+	local probes, pending = 0, false
+	for _, pane in ipairs(candidates) do
+		if not scan.tried[pane] then
+			if probes >= SCAN_PROBES or tern.now() > deadline then
+				pending = true
+				break
+			end
+			probes = probes + 1
+			local fp = fingerprint(cx, pane)
+			scan.tried[pane] = true
+			if fp and fp_matches(pin.fp, fp) then
+				scans[task.id] = nil
+				return pane
+			end
+		end
+	end
+	if pending then
+		return nil, true
+	end
+	scans[task.id] = nil
+	return nil
+end
+
 -- The block a task was given: the pins document, else the pane an older
 -- version kept in the task's own state.
 local function pin_of(p, s, id)
@@ -270,7 +334,7 @@ end
 local function target(cx, task, pin, states)
 	local pinned = pin and pin.pane
 	if usable(cx, pinned, states) then
-		if fp_matches(pin.fp, fingerprint(cx, pinned)) then
+		if not pin.fp or fp_matches(pin.fp, fingerprint(cx, pinned)) then
 			warn_ok("drift:" .. task.id)
 			return pinned
 		end
@@ -279,12 +343,7 @@ local function target(cx, task, pin, states)
 	end
 	local scoped = scoped_panes(cx, task)
 	if scoped then
-		for _, info in ipairs(scoped) do
-			if usable(cx, info.pane, states) and fp_matches(pin and pin.fp, fingerprint(cx, info.pane)) then
-				return info.pane
-			end
-		end
-		return nil
+		return scoped_target(cx, task, pin, states, scoped)
 	end
 	-- No placement configured: title lookup, but only at the task's own cwd.
 	local cwd = task.cwd and expanded_cwd(tostring(task.cwd))
@@ -398,6 +457,7 @@ local function remember_pin(task, pin, pane)
 		fp = existing and existing.pane == pane and existing.fp or nil,
 	}
 	save_pins(current)
+	scans[task.id] = nil
 end
 
 local function record(ts, outcome, detail)
@@ -481,7 +541,7 @@ end
 local function run_task(cx, task, now)
 	local interval, at = schedule_of(task)
 	if not interval then
-		return
+		return false
 	end
 	local id = task.id
 	local at_key = at and tostring(task.at) or nil
@@ -512,13 +572,18 @@ local function run_task(cx, task, now)
 				t.next = ts.next
 			end)
 		end
-		return
+		return false
 	end
 	ts.next = arm_next(at, interval, now, false)
 
 	local pin = pin_of(pins(), s, id)
 	local states = agent_states(cx)
-	local pane = target(cx, task, pin, states)
+	local pane, scanning = target(cx, task, pin, states)
+	if scanning then
+		-- The blocks in the task's place are not all looked at yet; keep the
+		-- slot due and finish on a later tick instead of pausing this hook.
+		return false
+	end
 	if pane and (states[pane] == "working" or states[pane] == "waiting_input") then
 		-- The block is still on an earlier turn: leave it alone, look again soon.
 		write_task(id, function(t)
@@ -528,7 +593,7 @@ local function run_task(cx, task, now)
 			t.claim = nil
 			record(t, "skipped", "block " .. pane .. " is " .. states[pane])
 		end)
-		return
+		return false
 	end
 
 	local ok_prompt, prompt = pcall(prompt_text, task)
@@ -541,7 +606,7 @@ local function run_task(cx, task, now)
 			record(t, "failed", tostring(prompt))
 		end)
 		cx:toast("error", id .. ": run failed", tostring(prompt))
-		return
+		return true
 	end
 
 	-- Claim the slot before anything is sent: only the window whose token
@@ -554,11 +619,11 @@ local function run_task(cx, task, now)
 		t.claim = token
 	end)
 	if not claimed then
-		return -- the store never took the claim; the next tick retries
+		return false -- the store never took the claim; the next tick retries
 	end
 	local fresh = ((state().tasks or {})[id]) or {}
 	if fresh.claim ~= token then
-		return
+		return false
 	end
 
 	local ok, sent, created, note = pcall(deliver, cx, task, pane, prompt)
@@ -585,6 +650,7 @@ local function run_task(cx, task, now)
 		end)
 		cx:toast("error", id .. ": run failed", tostring(sent))
 	end
+	return true
 end
 
 local function tick(cx)
@@ -602,7 +668,7 @@ local function tick(cx)
 		end
 		warn_ok("config")
 		local dup = duplicate_ids(list)
-		local seen, bad_entry = {}, false
+		local seen, bad_entry, stopped = {}, false, false
 		for _, task in ipairs(list) do
 			local id = type(task) == "table" and type(task.id) == "string" and task.id or nil
 			if not id then
@@ -625,16 +691,21 @@ local function tick(cx)
 						end
 					else
 						warn_ok("schedule:" .. id)
-						local ok_run, run_err = pcall(run_task, cx, task, now_ms())
+						local ok_run, acted = pcall(run_task, cx, task, now_ms())
 						if not ok_run then
 							-- The slot may be claimed already: say what lost the run.
-							tern.log.warn("scheduler: " .. id .. ": run failed: " .. tostring(run_err))
+							tern.log.warn("scheduler: " .. id .. ": run failed: " .. tostring(acted))
+						elseif acted then
+							-- One prompt per tick: a burst of opens can outrun the hook
+							-- budget, so the rest wait half a minute.
+							stopped = true
+							break
 						end
 					end
 				end
 			end
 		end
-		if not bad_entry then
+		if not bad_entry and not stopped then
 			warn_ok("entry")
 		end
 		-- Forget tasks that left tasks.json, their schedule and their pin both.
@@ -721,13 +792,20 @@ tern.command({
 			end
 			local task = choice.task
 			local pin = pin_of(pins(), state(), task.id)
-			local ok, pane, created, note = pcall(function()
+			local ok, pane, created, note, scanning = pcall(function()
 				local prompt = prompt_text(task)
-				local target_pane = target(pick_cx, task, pin, agent_states(pick_cx))
+				local target_pane, wait = target(pick_cx, task, pin, agent_states(pick_cx))
+				if wait then
+					return nil, nil, nil, true
+				end
 				return deliver(pick_cx, task, target_pane, prompt)
 			end)
 			if not ok then
 				pick_cx:toast("error", task.id .. ": run failed", tostring(pane))
+				return
+			end
+			if scanning then
+				pick_cx:toast("info", task.id .. ": still looking for its block", "run it again in a moment")
 				return
 			end
 			write_task(task.id, function(t)
@@ -774,6 +852,7 @@ tern.command({
 			local p = pins()
 			p[choice.task.id] = { pane = focused, fp = fingerprint(pick_cx, focused) }
 			save_pins(p)
+			scans[choice.task.id] = nil
 			pick_cx:toast("success", choice.task.id .. ": pinned", "pane " .. focused)
 		end)
 	end,

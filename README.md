@@ -85,11 +85,15 @@ Copy them to `tasks.json` and your own prompt files to get started.
   `cwd` (`~` included). A block whose agent exited is not reused. Failing all
   that, a new agent block is opened with the prompt and moved to `place`; if
   the move fails the run records the reason and toasts instead of reporting a
-  clean `opened`.
+  clean `opened`. Comparing a block's conversation means reading its chat, so a
+  scan of the blocks in a place reads a few per tick and resumes on the next; a
+  slow first read cannot pause the scheduler.
 - **Delivery** — `cx.agents:ask(pane, prompt)`. Native omp receives one atomic
   TSP send; the prompt queues until the block can take it. A pinned block still
   working or waiting for input is left alone: the slot is recorded as `skipped`
-  and looked at again within five minutes, so prompts do not pile up.
+  and looked at again within five minutes, so prompts do not pile up. At most
+  one prompt is sent per tick, so tasks that come due together go half a minute
+  apart instead of opening a burst of blocks at once.
 - **One owner** — a single window holds the schedule through a heartbeat
   refreshed every minute; another window takes over once it is three minutes
   stale, and the claim below keeps a handover from double-delivering. A failed
@@ -109,11 +113,13 @@ VM, where `tern.plugin.dir` and `tern.kv` resolve to Carly's directory.
 `test/run.sh` runs `window.luau` unchanged against stubs that stand in for
 Tern and checks what must not regress: a new task runs at once, a daily `at`
 lands at its local time, a run that cannot read its prompt is recorded as
-failed, a busy block is not prompted, a pin made during a run survives it, the
-commands report a `tasks.json` they cannot read, entries that share an id never
-run, and a block is found by its task's title at a `cwd` that starts with `~`.
-It needs the [Luau CLI](https://github.com/luau-lang/luau/releases) as `luau` on
-`PATH` or at `$LUAU`:
+failed, a busy block is not prompted, a pin made during a run survives it, a
+scan of a place's blocks reads only a few per tick, two due tasks are sent a
+tick apart, the commands report a `tasks.json` they cannot read, entries that
+share an id never run, and a block is found by its task's title at a `cwd` that
+starts with `~`. It needs the
+[Luau CLI](https://github.com/luau-lang/luau/releases) as `luau` on `PATH`
+or at `$LUAU`:
 
 ```bash
 test/run.sh
