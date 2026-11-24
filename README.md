@@ -9,7 +9,7 @@ Author: He lijun
 ## Install
 
 ```bash
-tern plugin install github.com/hljhljhlj/tern-scheduler
+tern plugin install github.com/xiaolikt/tern-scheduler
 # or, while developing:
 tern plugin link ~/Project/tern-scheduler
 tern plugin list --json     # status: ready, no problems
