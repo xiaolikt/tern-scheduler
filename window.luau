@@ -2,11 +2,13 @@
 -- delivers its prompt into one fixed agent block per task.
 local TICK_MS = 30 * 1000
 local MIN_INTERVAL_MS = 30 * 1000
+local BUSY_RETRY_MS = 5 * 60 * 1000
+local DAY_MS = 24 * 3600 * 1000
 local HISTORY = 10
-local OWNER_STALE_MS = 15 * 60 * 1000
-local HEARTBEAT_MS = 5 * 60 * 1000
+local OWNER_STALE_MS = 3 * 60 * 1000
+local HEARTBEAT_MS = 60 * 1000
 local FP_WINDOW = 1000
-local UNITS = { s = 1000, m = 60 * 1000, h = 3600 * 1000, d = 24 * 3600 * 1000 }
+local UNITS = { s = 1000, m = 60 * 1000, h = 3600 * 1000, d = DAY_MS }
 local warned = {}
 
 local function warn_once(key, text)
@@ -18,16 +20,33 @@ local function warn_once(key, text)
 	return true
 end
 
+-- Re-arms a warning once its condition is gone, so a configuration that is
+-- fixed and broken again is reported again.
+local function warn_ok(key)
+	warned[key] = nil
+end
+
 local function now_ms()
 	return os.time() * 1000
 end
 
+-- Two documents: `state` holds the owner and each task's schedule and history,
+-- `pins` the block each task was given. They are written separately, so a run
+-- can never revert a pin made while it was sending.
 local function state()
 	return tern.kv.get("state") or {}
 end
 
-local function save(s)
+local function pins()
+	return tern.kv.get("pins") or {}
+end
+
+local function save_state(s)
 	tern.kv.set("state", s)
+end
+
+local function save_pins(p)
+	tern.kv.set("pins", p)
 end
 
 local function task_state(s, id)
@@ -36,6 +55,20 @@ local function task_state(s, id)
 		s.tasks[id] = {}
 	end
 	return s.tasks[id]
+end
+
+local function write_state(fn)
+	local s = state()
+	fn(s)
+	save_state(s)
+end
+
+-- Changes one task in the freshest document: a run or a command touches only
+-- its own task, never another window's edits to the rest.
+local function write_task(id, fn)
+	write_state(function(s)
+		fn(task_state(s, id))
+	end)
 end
 
 -- Returns the task list, or nil plus a reason when the configuration cannot be
@@ -52,23 +85,67 @@ local function tasks()
 	return parsed
 end
 
+-- Ids that appear more than once in the task list. Every entry with such an
+-- id is skipped: two entries would share one task state and reset each
+-- other's slot on every tick, so neither would ever run.
+local function duplicate_ids(list)
+	local seen, dup = {}, {}
+	for _, task in ipairs(list) do
+		if type(task) == "table" and type(task.id) == "string" then
+			if seen[task.id] then
+				dup[task.id] = true
+			end
+			seen[task.id] = true
+		end
+	end
+	return dup
+end
+
 local function test_mode()
 	return tern.fs.exists(tern.plugin.dir .. "/test-once")
 end
 
-local function interval_ms(task)
+-- A task's interval and, when it has a daily `at`, its local hour and minute;
+-- nil plus the reason when the task cannot be scheduled.
+local function schedule_of(task)
 	if test_mode() then
 		return 60 * 1000
 	end
 	local n, unit = tostring(task.every or ""):match("^(%d+)([smhd])$")
-	if not n then
-		return nil
+	local interval = n and tonumber(n) * UNITS[unit]
+	if not interval or interval < MIN_INTERVAL_MS then
+		return nil, nil, "bad every " .. tostring(task.every)
 	end
-	local ms = tonumber(n) * UNITS[unit]
-	if ms < MIN_INTERVAL_MS then
-		return nil
+	if task.at == nil then
+		return interval
 	end
-	return ms
+	local h, m = tostring(task.at):match("^(%d%d?):(%d%d)$")
+	h, m = h and tonumber(h), m and tonumber(m)
+	if not h or h > 23 or m > 59 then
+		return nil, nil, "bad at " .. tostring(task.at)
+	end
+	if interval ~= DAY_MS then
+		return nil, nil, "at needs every: 1d"
+	end
+	return interval, { h = h, m = m }
+end
+
+-- The next slot: the local time `at` names when the task has one, else one
+-- interval from now. A task's first slot is due at once (or at the next `at`).
+local function arm_next(at, interval, now, first)
+	if not at then
+		return first and now or now + interval
+	end
+	local d = os.date("*t", math.floor(now / 1000))
+	local today = os.time({ year = d.year, month = d.month, day = d.day, hour = at.h, min = at.m, sec = 0 })
+	if today and today * 1000 > now then
+		return today * 1000
+	end
+	local tomorrow = os.time({ year = d.year, month = d.month, day = d.day + 1, hour = at.h, min = at.m, sec = 0 })
+	if tomorrow then
+		return tomorrow * 1000
+	end
+	return first and now or now + interval
 end
 
 local function prompt_text(task)
@@ -79,15 +156,33 @@ local function prompt_text(task)
 	return tern.fs.read(tern.plugin.dir .. "/" .. name)
 end
 
-local function usable(cx, pane)
+-- Every agent block's state by pane id; empty when the list is unavailable.
+local function agent_states(cx)
+	local states = {}
+	local ok, list = pcall(cx.agents.list, cx.agents)
+	if ok and type(list) == "table" then
+		for _, block in ipairs(list) do
+			if block.pane then
+				states[block.pane] = block.state
+			end
+		end
+	end
+	return states
+end
+
+local function usable(cx, pane, states)
 	if type(pane) ~= "number" then
 		return false
 	end
 	local info = cx.session:pane(pane)
-	return info ~= nil and info.kind == "agent"
+	if info == nil or info.kind ~= "agent" then
+		return false
+	end
+	-- An agent that exited cannot take a prompt; open a fresh block instead.
+	return not (states and states[pane] == "exited")
 end
 
-local function hash_tail(text)
+local function hash_head(text)
 	local h = 5381
 	for i = 1, #text do
 		h = (h * 33 + string.byte(text, i)) % 2147483647
@@ -105,7 +200,7 @@ local function fingerprint(cx, pane)
 		return nil
 	end
 	local first = list[1]
-	return { n = #list, head = hash_tail(first and first.text or "") }
+	return { n = #list, head = hash_head(first and first.text or "") }
 end
 
 -- An empty transcript, a fingerprint without a head, or a transcript longer
@@ -148,10 +243,36 @@ local function scoped_panes(cx, task)
 	return panes
 end
 
-local function target(cx, task, ts)
-	if usable(cx, ts.pane) then
-		if fp_matches(ts.fp, fingerprint(cx, ts.pane)) then
-			return ts.pane
+-- task.cwd spelled the way PaneInfo.cwd spells it: Tern expands a leading
+-- "~" when it opens a block, so the comparison has to as well.
+local function expanded_cwd(path)
+	local home = tern.getenv("HOME")
+	if home and (path == "~" or path:sub(1, 2) == "~/") then
+		return home .. path:sub(2)
+	end
+	return path
+end
+
+-- The block a task was given: the pins document, else the pane an older
+-- version kept in the task's own state.
+local function pin_of(p, s, id)
+	local pin = p[id]
+	if pin and type(pin.pane) == "number" then
+		return pin
+	end
+	local ts = ((s or {}).tasks or {})[id]
+	if ts and type(ts.pane) == "number" then
+		return { pane = ts.pane, fp = ts.fp }
+	end
+	return nil
+end
+
+local function target(cx, task, pin, states)
+	local pinned = pin and pin.pane
+	if usable(cx, pinned, states) then
+		if fp_matches(pin.fp, fingerprint(cx, pinned)) then
+			warn_ok("drift:" .. task.id)
+			return pinned
 		end
 		warn_once("drift:" .. task.id, task.id .. ": pinned block changed conversation; reopening")
 		return nil
@@ -159,18 +280,19 @@ local function target(cx, task, ts)
 	local scoped = scoped_panes(cx, task)
 	if scoped then
 		for _, info in ipairs(scoped) do
-			if fp_matches(ts.fp, fingerprint(cx, info.pane)) then
+			if usable(cx, info.pane, states) and fp_matches(pin and pin.fp, fingerprint(cx, info.pane)) then
 				return info.pane
 			end
 		end
 		return nil
 	end
 	-- No placement configured: title lookup, but only at the task's own cwd.
+	local cwd = task.cwd and expanded_cwd(tostring(task.cwd))
 	for _, spec in ipairs({ task.id, task.title }) do
 		local resolved = cx.session:resolve(tostring(spec))
-		if usable(cx, resolved) then
+		if usable(cx, resolved, states) then
 			local info = cx.session:pane(resolved)
-			if not task.cwd or info.cwd == task.cwd then
+			if not cwd or info.cwd == cwd then
 				return resolved
 			end
 		end
@@ -184,7 +306,7 @@ end
 --   { "tab": "name" }                         that tab in the current session
 local function plain_shell(cx, tab)
 	for _, info in ipairs(cx.session:panes()) do
-		if info.tab == tab and info.command == nil and info.program ~= nil then
+		if info.tab == tab and info.program ~= nil then
 			return info.pane
 		end
 	end
@@ -192,12 +314,14 @@ local function plain_shell(cx, tab)
 end
 
 local function place_block(cx, pane, p)
-	local session, born_tab
+	local before = cx.sessions:current()
+	local session, born_tab, created
 	if p.session then
 		session = cx.session:find_session(tostring(p.session))
 		if not session then
 			local made = cx.sessions:create({ name = tostring(p.session) })
 			session = made and made.id
+			created = session
 			-- A new session is born with one empty shell tab; remember it so the
 			-- block's own tab can replace it.
 			for _, info in ipairs(cx.session:sessions()) do
@@ -207,8 +331,7 @@ local function place_block(cx, pane, p)
 			end
 		end
 	else
-		local current = cx.sessions:current()
-		session = current and current.id
+		session = before and before.id
 	end
 	if not session then
 		return false
@@ -235,14 +358,16 @@ local function place_block(cx, pane, p)
 			end)
 		end
 	end
+	-- Creating the session showed it; put the window back where the user was.
+	if created and before and before.id ~= created then
+		pcall(cx.sessions.switch, cx.sessions, before.id)
+	end
 	return moved ~= nil
 end
 
--- Returns pane, created, note. note is set when the block opened but could not
--- be moved to task.place, so the caller can surface it instead of reporting a
--- clean "opened".
-local function deliver(cx, task, ts, prompt)
-	local pane = target(cx, task, ts)
+-- Sends into `pane` when a target was found, else opens a new block (and moves
+-- it to the task's place). Returns pane, created, note.
+local function deliver(cx, task, pane, prompt)
 	if pane then
 		cx.agents:ask(pane, prompt)
 		return pane, false, nil
@@ -260,38 +385,19 @@ local function deliver(cx, task, ts, prompt)
 	return created, true, note
 end
 
--- The prompt lands in the block's transcript only after the block takes it,
--- so the fingerprint is retried with growing delays until the transcript is
--- non-empty.
-local function refresh_fp(task_id, pane)
-	local delays = { 4000, 11000, 30000, 60000 }
-	local function attempt(i)
-		tern.timer(delays[i], function(cx)
-			local settled = false
-			local ok = pcall(function()
-				local fp = fingerprint(cx, pane)
-				if fp and fp.n > 0 then
-					local s = state()
-					local ts = task_state(s, task_id)
-					if ts.pane == pane then
-						ts.fp = fp
-						save(s)
-					end
-					settled = true
-				end
-			end)
-			if not ok then
-				warn_once("fp:" .. task_id, task_id .. ": fingerprint refresh failed")
-				settled = true
-			end
-			if not settled and i < #delays then
-				attempt(i + 1)
-			elseif not settled then
-				warn_once("fp:" .. task_id, task_id .. ": transcript still empty; fingerprint left unknown")
-			end
-		end)
+-- Remembers the block a run went to, unless the user pinned another block
+-- while it was being sent.
+local function remember_pin(task, pin, pane)
+	local current = pins()
+	local existing = current[task.id]
+	if existing and existing.pane and existing.pane ~= pane and existing.pane ~= (pin and pin.pane) then
+		return
 	end
-	attempt(1)
+	current[task.id] = {
+		pane = pane,
+		fp = existing and existing.pane == pane and existing.fp or nil,
+	}
+	save_pins(current)
 end
 
 local function record(ts, outcome, detail)
@@ -310,92 +416,181 @@ local function when_text(ms)
 end
 
 -- One window owns the schedule; the owner refreshes a heartbeat and another
--- window takes over only once that heartbeat is stale.
-local function own(cx, s, now)
+-- window takes over once it goes stale. Claims still make a handover safe.
+local function own(cx, now)
+	local s = state()
 	local key = cx:window_key()
+	local function take()
+		write_state(function(doc)
+			doc.owner = key
+			doc.heartbeat = now
+		end)
+	end
 	if s.owner == key then
 		if type(s.heartbeat) ~= "number" or now - s.heartbeat >= HEARTBEAT_MS then
-			s.heartbeat = now
-			return true, true
+			take()
 		end
-		return true, false
+		return true
 	end
 	if type(s.owner) == "string" and type(s.heartbeat) == "number" and now - s.heartbeat < OWNER_STALE_MS then
-		return false, false
-	end
-	s.owner = key
-	s.heartbeat = now
-	return true, true
-end
-
--- A due slot is claimed in kv before anything is delivered: the claim (the new
--- next) is saved first, re-read, and only the window whose token survived
--- delivers. A crash can therefore lose a run, never duplicate one.
-local function run_task(cx, task, s, now)
-	local ts = task_state(s, task.id)
-	local interval = interval_ms(task)
-	if not interval then
 		return false
 	end
+	take()
+	return true
+end
+
+-- The prompt lands in the block's transcript only after the block takes it, so
+-- the fingerprint is retried with growing delays until it is non-empty.
+local function refresh_fp(task_id, pane)
+	local delays = { 4000, 11000, 30000, 60000 }
+	local function attempt(i)
+		tern.timer(delays[i], function(cx)
+			local settled = false
+			local ok = pcall(function()
+				local fp = fingerprint(cx, pane)
+				if fp and fp.n > 0 then
+					local p = pins()
+					local pin = p[task_id]
+					if pin and pin.pane == pane then
+						pin.fp = fp
+						save_pins(p)
+					end
+					settled = true
+				end
+			end)
+			if not ok then
+				warn_once("fp:" .. task_id, task_id .. ": fingerprint refresh failed")
+				settled = true
+			end
+			if settled then
+				warn_ok("fp:" .. task_id)
+				warn_ok("fp-empty:" .. task_id)
+			elseif i < #delays then
+				attempt(i + 1)
+			else
+				warn_once("fp-empty:" .. task_id, task_id .. ": transcript still empty; fingerprint left unknown")
+			end
+		end)
+	end
+	attempt(1)
+end
+
+-- One due check and, when due, one delivery. Reads this task's own state fresh
+-- and writes back only that task, so another window's edits to the rest of the
+-- document survive.
+local function run_task(cx, task, now)
+	local interval, at = schedule_of(task)
+	if not interval then
+		return
+	end
+	local id = task.id
+	local at_key = at and tostring(task.at) or nil
+	local s = state()
+	local ts = task_state(s, id)
+
 	local dirty = false
-	if ts.interval ~= interval then
-		local had_interval = type(ts.interval) == "number"
+	if ts.interval ~= interval or ts.at ~= at_key then
+		local had = type(ts.interval) == "number"
 		ts.interval = interval
-		-- Adopt the interval without moving an already-armed slot (state written
-		-- by older versions has no interval); recompute only real changes.
-		if had_interval or type(ts.next) ~= "number" then
-			ts.next = now + interval
+		ts.at = at_key
+		-- Adopt the interval without moving a slot a first run already armed;
+		-- recompute only a real change (state from older versions has no interval).
+		if had and type(ts.next) == "number" then
+			ts.next = arm_next(at, interval, now, false)
 		end
 		dirty = true
 	end
 	if type(ts.next) ~= "number" then
-		ts.next = now + interval
-		return true
+		ts.next = arm_next(at, interval, now, true)
+		dirty = true
 	end
 	if now < ts.next then
-		return dirty
-	end
-	local due = ts.next
-	ts.next = now + interval
-	local token = tostring(now) .. ":" .. cx:window_key()
-	ts.claim = token
-	local saved = pcall(save, s)
-	if not saved then
-		-- The claim never reached disk; forget it and retry on the next tick.
-		ts.next = due
-		ts.claim = nil
-		return false
-	end
-	local fresh = state()
-	local fts = ((fresh.tasks or {})[task.id])
-	if type(fts) ~= "table" or fts.claim ~= token then
-		return false
-	end
-	local ok, pane, created, note = pcall(deliver, cx, task, ts, prompt_text(task))
-	if ok then
-		ts.pane = pane
-		record(ts, created and "opened" or "sent", note)
-		if note then
-			cx:toast("error", task.id .. ": " .. note, nil)
+		if dirty then
+			write_task(id, function(t)
+				t.interval = interval
+				t.at = at_key
+				t.next = ts.next
+			end)
 		end
-		refresh_fp(task.id, pane)
-	else
-		record(ts, "failed", tostring(pane))
-		cx:toast("error", task.id .. ": run failed", tostring(pane))
+		return
 	end
-	save(s)
-	return true
+	ts.next = arm_next(at, interval, now, false)
+
+	local pin = pin_of(pins(), s, id)
+	local states = agent_states(cx)
+	local pane = target(cx, task, pin, states)
+	if pane and (states[pane] == "working" or states[pane] == "waiting_input") then
+		-- The block is still on an earlier turn: leave it alone, look again soon.
+		write_task(id, function(t)
+			t.interval = interval
+			t.at = at_key
+			t.next = now + math.min(interval, BUSY_RETRY_MS)
+			t.claim = nil
+			record(t, "skipped", "block " .. pane .. " is " .. states[pane])
+		end)
+		return
+	end
+
+	local ok_prompt, prompt = pcall(prompt_text, task)
+	if not ok_prompt then
+		write_task(id, function(t)
+			t.interval = interval
+			t.at = at_key
+			t.next = ts.next
+			t.claim = nil
+			record(t, "failed", tostring(prompt))
+		end)
+		cx:toast("error", id .. ": run failed", tostring(prompt))
+		return
+	end
+
+	-- Claim the slot before anything is sent: only the window whose token
+	-- survives the store write delivers, so two windows cannot send twice.
+	local token = tostring(now) .. ":" .. cx:window_key()
+	local claimed = pcall(write_task, id, function(t)
+		t.interval = interval
+		t.at = at_key
+		t.next = ts.next
+		t.claim = token
+	end)
+	if not claimed then
+		return -- the store never took the claim; the next tick retries
+	end
+	local fresh = ((state().tasks or {})[id]) or {}
+	if fresh.claim ~= token then
+		return
+	end
+
+	local ok, sent, created, note = pcall(deliver, cx, task, pane, prompt)
+	if ok then
+		write_task(id, function(t)
+			t.interval = interval
+			t.at = at_key
+			t.next = ts.next
+			t.claim = nil
+			record(t, created and "opened" or "sent", note)
+		end)
+		if note then
+			cx:toast("error", id .. ": " .. note, nil)
+		end
+		remember_pin(task, pin, sent)
+		refresh_fp(id, sent)
+	else
+		write_task(id, function(t)
+			t.interval = interval
+			t.at = at_key
+			t.next = ts.next
+			t.claim = nil
+			record(t, "failed", tostring(sent))
+		end)
+		cx:toast("error", id .. ": run failed", tostring(sent))
+	end
 end
 
 local function tick(cx)
 	local ok, err = pcall(function()
-		local s = state()
 		local now = now_ms()
-		local owns, dirty = own(cx, s, now)
-		if dirty then
-			save(s)
-		end
-		if not owns then
+		if not own(cx, now) then
 			return
 		end
 		local list, cfg_err = tasks()
@@ -405,20 +600,68 @@ local function tick(cx)
 			end
 			return
 		end
+		warn_ok("config")
+		local dup = duplicate_ids(list)
+		local seen, bad_entry = {}, false
 		for _, task in ipairs(list) do
-			if type(task) == "table" and type(task.id) == "string" then
-				if not interval_ms(task) then
-					if warn_once("every:" .. task.id, task.id .. ": bad every " .. tostring(task.every)) then
-						cx:toast("error", "scheduler: " .. task.id .. ": bad every " .. tostring(task.every), nil)
+			local id = type(task) == "table" and type(task.id) == "string" and task.id or nil
+			if not id then
+				bad_entry = true
+				if warn_once("entry", "a task entry has no string id; skipped") then
+					cx:toast("error", "scheduler: a task entry has no string id; skipped", nil)
+				end
+			else
+				seen[id] = true
+				if dup[id] then
+					if warn_once("dup:" .. id, id .. ": duplicate task id; skipped") then
+						cx:toast("error", "scheduler: " .. id .. ": duplicate id in tasks.json", nil)
 					end
 				else
-					local ok_run, changed = pcall(run_task, cx, task, s, now_ms())
-					dirty = dirty or (ok_run and changed)
+					warn_ok("dup:" .. id)
+					local interval, _, why = schedule_of(task)
+					if not interval then
+						if warn_once("schedule:" .. id, id .. ": " .. why) then
+							cx:toast("error", "scheduler: " .. id .. ": " .. why, nil)
+						end
+					else
+						warn_ok("schedule:" .. id)
+						local ok_run, run_err = pcall(run_task, cx, task, now_ms())
+						if not ok_run then
+							-- The slot may be claimed already: say what lost the run.
+							tern.log.warn("scheduler: " .. id .. ": run failed: " .. tostring(run_err))
+						end
+					end
 				end
 			end
 		end
-		if dirty then
-			save(s)
+		if not bad_entry then
+			warn_ok("entry")
+		end
+		-- Forget tasks that left tasks.json, their schedule and their pin both.
+		local stale
+		for id in pairs((state().tasks or {})) do
+			if not seen[id] then
+				stale = stale or {}
+				stale[#stale + 1] = id
+			end
+		end
+		if stale then
+			write_state(function(doc)
+				for _, id in ipairs(stale) do
+					doc.tasks[id] = nil
+				end
+			end)
+		end
+		local p = pins()
+		local pruned = false
+		for id in pairs(p) do
+			if not seen[id] then
+				p[id] = nil
+				pruned = true
+			end
+		end
+		if pruned then
+			save_pins(p)
 		end
 	end)
 	if not ok then
@@ -427,20 +670,35 @@ local function tick(cx)
 	tern.timer(TICK_MS, tick)
 end
 
+-- Picker rows, or nil plus the reason when the configuration cannot be read;
+-- the caller toasts the reason instead of offering an empty list.
 local function items()
 	local s = state()
-	local list = {}
-	for _, task in ipairs(tasks()) do
-		local ts = (s.tasks or {})[task.id] or {}
-		local last = ts.runs and ts.runs[#ts.runs]
-		table.insert(list, {
-			label = task.title or task.id,
-			detail = "next " .. when_text(ts.next)
-				.. (last and (" · last " .. when_text(last.at) .. " " .. last.outcome) or " · no runs"),
-			task = task,
-		})
+	local p = pins()
+	local list, cfg_err = tasks()
+	if not list then
+		return nil, cfg_err
 	end
-	return list
+	local dup = duplicate_ids(list)
+	local rows = {}
+	for _, task in ipairs(list) do
+		local id = type(task) == "table" and type(task.id) == "string" and task.id or nil
+		if id then
+			local ts = (s.tasks or {})[id] or {}
+			local last = ts.runs and ts.runs[#ts.runs]
+			local pin = pin_of(p, s, id)
+			table.insert(rows, {
+				label = task.title or id,
+				detail = "next " .. when_text(ts.next)
+					.. (last and (" · last " .. when_text(last.at) .. " " .. last.outcome) or " · no runs")
+					.. (last and last.detail and (" (" .. last.detail .. ")") or "")
+					.. (pin and (" · pinned " .. pin.pane .. (pin.fp and "" or " (conversation unknown)")) or "")
+					.. (dup[id] and " · duplicate id, skipped" or ""),
+				task = task,
+			})
+		end
+	end
+	return rows
 end
 
 tern.command({
@@ -448,34 +706,39 @@ tern.command({
 	title = "Scheduler: tasks",
 	icon = "list",
 	run = function(cx)
-		local list = items()
-		if #list == 0 then
-			cx:toast("info", "scheduler: tasks.json 里没有任务")
+		local list, cfg_err = items()
+		if not list then
+			cx:toast("error", "scheduler: " .. cfg_err, nil)
 			return
 		end
-		cx:pick({ items = list, placeholder = "选择任务，回车立即运行" }):next(function(choice, err, pick_cx)
+		if #list == 0 then
+			cx:toast("info", "scheduler: no tasks in tasks.json", nil)
+			return
+		end
+		cx:pick({ items = list, placeholder = "Pick a task; Enter runs it now" }):next(function(choice, _err, pick_cx)
 			if not choice or not pick_cx then
 				return
 			end
 			local task = choice.task
+			local pin = pin_of(pins(), state(), task.id)
 			local ok, pane, created, note = pcall(function()
-				local s = state()
-				local ts = task_state(s, task.id)
-				local pane, created, note = deliver(pick_cx, task, ts, prompt_text(task))
-				ts.pane = pane
-				record(ts, "manual", note)
-				save(s)
-				return pane, created, note
+				local prompt = prompt_text(task)
+				local target_pane = target(pick_cx, task, pin, agent_states(pick_cx))
+				return deliver(pick_cx, task, target_pane, prompt)
 			end)
 			if not ok then
 				pick_cx:toast("error", task.id .. ": run failed", tostring(pane))
 				return
 			end
+			write_task(task.id, function(t)
+				record(t, "manual", note)
+			end)
+			remember_pin(task, pin, pane)
 			refresh_fp(task.id, pane)
 			if note then
 				pick_cx:toast("error", task.id .. ": " .. note, nil)
 			end
-			pick_cx:toast("info", task.id .. ": 已投递", created and ("新 block " .. pane) or ("block " .. pane))
+			pick_cx:toast("info", task.id .. ": sent", created and ("opened block " .. pane) or ("block " .. pane))
 		end)
 	end,
 })
@@ -487,29 +750,31 @@ tern.command({
 	run = function(cx)
 		local focused = cx.session:focused()
 		if not focused then
-			cx:toast("error", "scheduler: 没有聚焦的 block")
+			cx:toast("error", "scheduler: focus an agent block first", nil)
 			return
 		end
 		local ok, err = pcall(cx.agents.get, cx.agents, focused)
 		if not ok then
-			cx:toast("error", "scheduler: 聚焦的不是 agent block", tostring(err))
+			cx:toast("error", "scheduler: the focused block is not an agent", tostring(err))
 			return
 		end
-		local list = items()
+		local list, cfg_err = items()
+		if not list then
+			cx:toast("error", "scheduler: " .. cfg_err, nil)
+			return
+		end
 		if #list == 0 then
-			cx:toast("info", "scheduler: tasks.json 里没有任务")
+			cx:toast("info", "scheduler: no tasks in tasks.json", nil)
 			return
 		end
-		cx:pick({ items = list, placeholder = "把聚焦的 block 固定给哪个任务" }):next(function(choice, _err, pick_cx)
+		cx:pick({ items = list, placeholder = "Pin the focused block to which task" }):next(function(choice, _err, pick_cx)
 			if not choice or not pick_cx then
 				return
 			end
-			local s = state()
-			local ts = task_state(s, choice.task.id)
-			ts.pane = focused
-			ts.fp = fingerprint(pick_cx, focused)
-			save(s)
-			pick_cx:toast("success", choice.task.id .. ": 目标已固定", "pane " .. focused)
+			local p = pins()
+			p[choice.task.id] = { pane = focused, fp = fingerprint(pick_cx, focused) }
+			save_pins(p)
+			pick_cx:toast("success", choice.task.id .. ": pinned", "pane " .. focused)
 		end)
 	end,
 })
@@ -519,19 +784,24 @@ tern.command({
 	title = "Scheduler: status",
 	icon = "clock",
 	run = function(cx)
-		local list = items()
-		if #list == 0 then
-			cx:toast("info", "scheduler: tasks.json 里没有任务")
+		local list, cfg_err = items()
+		if not list then
+			cx:toast("error", "scheduler: " .. cfg_err, nil)
 			return
 		end
+		if #list == 0 then
+			cx:toast("info", "scheduler: no tasks in tasks.json", nil)
+			return
+		end
+		local s = state()
 		local nearest
 		for _, item in ipairs(list) do
-			local ts = ((state().tasks or {})[item.task.id]) or {}
+			local ts = (s.tasks or {})[item.task.id] or {}
 			if type(ts.next) == "number" and (nearest == nil or ts.next < nearest) then
 				nearest = ts.next
 			end
 		end
-		cx:toast("info", "scheduler: " .. #list .. " 个任务", "最近一次 " .. when_text(nearest))
+		cx:toast("info", "scheduler: " .. #list .. " tasks", "next " .. when_text(nearest))
 	end,
 })
 

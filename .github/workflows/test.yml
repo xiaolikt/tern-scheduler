@@ -1,0 +1,17 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Luau CLI
+        run: |
+          curl -sSL -o luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-ubuntu.zip
+          unzip -q luau.zip luau
+
+      - name: Offline tests
+        run: LUAU="$PWD/luau" test/run.sh
